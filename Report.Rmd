@@ -1,0 +1,214 @@
+---
+title: "Survival Analysis"
+author: "Guillaume Pealat"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(RSQLite)
+library(dbplyr)
+library(dplyr)
+library(lubridate)
+library(survival)
+library(survminer)
+```
+
+## Survival Analysis report
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r dataloading}
+#Create a function to load the data from the /data folder
+load_data<-function(){
+  # create db connection
+  conn <- dbConnect(SQLite(), './data/data.sqlite')
+  
+  # pull the fires table into RAM
+  fires <- tbl(conn, "Fires") %>% collect()
+  
+  # disconnect from db
+  dbDisconnect(conn)
+
+  return(fires)  
+}
+
+# Calling the function
+data <-load_data()
+```
+
+## EDA
+
+You can also embed plots, for example:
+
+```{r missing_values, echo=FALSE}
+# Some columns have mainly empty values so we decide to clean them out
+clean_data <- data %>%
+              select(-Shape, -OBJECTID,
+                     -ICS_209_PLUS_INCIDENT_JOIN_ID,
+                     -ICS_209_PLUS_COMPLEX_JOIN_ID,
+                     -MTBS_ID,-MTBS_FIRE_NAME,
+                     -COMPLEX_NAME,
+                     -NWCG_CAUSE_AGE_CATEGORY)
+
+# We also remove anything that is a local ID
+clean_data <- clean_data %>%
+              select(-LOCAL_FIRE_REPORT_ID, 
+                     -LOCAL_INCIDENT_ID,
+                     -FIRE_CODE,
+                     -FIRE_NAME,
+                     -COUNTY,
+                     -FIPS_CODE,
+                     -FIPS_NAME)
+```
+
+Now we want to filter our all rows which does not contains values in either one of those columns: DISCOVERY_DATE, DISCOVERY_TIME, CONT_DATE and CONT_TIME
+
+```{r}
+clean_data <- clean_data %>%
+                filter(DISCOVERY_DATE != "" & !is.na(DISCOVERY_DATE) &
+                         DISCOVERY_TIME != "" & !is.na(DISCOVERY_TIME) & 
+                        CONT_DATE != "" & !is.na(CONT_DATE) & 
+                         CONT_TIME != "" & !is.na(CONT_TIME) )
+```
+
+Note that we are now down to 1,276,794 data points.
+
+## Data engineering
+
+We now want to calculate the time each fire ran until they were stopped.
+We first have to create a new column for the exact date and time for both category. We calculate this difference in Hours.
+
+```{r}
+clean_data <- clean_data %>% 
+                  mutate(FIRE_START_DATE = as.POSIXct(paste(DISCOVERY_DATE, DISCOVERY_TIME), format = "%m/%d/%Y %H%M"),
+                         FIRE_END_DATE = as.POSIXct(paste(CONT_DATE, CONT_TIME), format = "%m/%d/%Y %H%M"))  %>%
+                  mutate(FIRE_TIME_HOUR = as.numeric(difftime(FIRE_END_DATE, FIRE_START_DATE, units="hours"))) %>%
+                  mutate(DISCOVERY_TIME = as.numeric(substr(DISCOVERY_TIME, 1, 2))) %>%
+                  select(-DISCOVERY_DATE, -CONT_DATE, -CONT_TIME)
+```
+
+We plot the histogram of the running time to check the data distribution:
+
+```{r}
+# Plot histogram
+ggplot(clean_data, aes(x = FIRE_TIME_HOUR)) +
+  geom_histogram(binwidth = 0.5, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+We realize that a lot of fire have been running for 0 minutes. It is probably minor fires and were just inputed in the system for statistics purposes. We will also exclude them.
+
+```{r}
+clean_data <- clean_data %>%
+                filter(FIRE_TIME_HOUR != 0 )
+```
+
+We are now down to 1,142,901 data points:
+
+```{r}
+# Plot histogram
+ggplot(clean_data, aes(x = FIRE_TIME_HOUR)) +
+  geom_histogram(binwidth = 0.5, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+The maximum time in the actual data is 8759.67 hours, which corresponds to 365 days (so a year).
+It seems unrealistic, so to cater with the fact we might have bad inputs, we will filter out all data that have a running time longer than a month (30*24= 720 H)
+
+```{r}
+clean_data <- clean_data %>%
+                filter(FIRE_TIME_HOUR <= 720 )
+```
+
+```{r}
+# Plot histogram
+ggplot(clean_data, aes(x = FIRE_TIME_HOUR)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+We finalize the data to add event = 1, to indicate that no data has to be censored.
+```{r}
+clean_data$event <- 1  # No censored data (all fires finished)
+
+```
+
+## Data analysis
+
+Checking if the type of fire (Human vs Natural) has an impact on the survival time.
+
+```{r}
+test <- clean_data %>%
+          filter(NWCG_CAUSE_CLASSIFICATION != "Missing data/not specified/undetermined")
+
+surv_object <- Surv(time = test$FIRE_TIME_HOUR, 
+                    event = test$event)
+
+km_fit <- survfit(surv_object ~ NWCG_CAUSE_CLASSIFICATION, data = test)
+
+ggsurvplot(km_fit, conf.int = TRUE, pval = TRUE, 
+           legend.title = "Fire Type",
+           xlab = "Fire Running Time (Hours)", 
+           title = "Kaplan-Meier Curve by Fire Type")
+```
+We can see that Natural fires tend to run for longer.
+
+In the human cases, are Arson started fires more at risk of propagation than other type of human fires?
+
+```{r}
+test <- clean_data %>%
+          filter(NWCG_CAUSE_CLASSIFICATION == "Human") %>%
+          mutate(type=ifelse(NWCG_GENERAL_CAUSE=="Arson/incendiarism", "Arson","Other"))
+
+surv_object <- Surv(time = test$FIRE_TIME_HOUR, 
+                    event = test$event)
+
+km_fit <- survfit(surv_object ~ type, data = test)
+
+ggsurvplot(km_fit, conf.int = TRUE, pval = TRUE, 
+           legend.title = "Fire Type",
+           xlab = "Fire Running Time (Hours)", 
+           title = "Kaplan-Meier Curve by Fire Type")
+```
+
+It does not seems so.
+
+Does the time of the day (morning/afternoon) has an impact on the duration of the fire:
+
+```{r}
+test <- clean_data %>%
+          mutate(period = ifelse(hour(FIRE_START_DATE) < 12, "Morning", "Afternoon"))
+
+surv_object <- Surv(time = clean_data$FIRE_TIME_HOUR, 
+                    event = clean_data$event)
+
+km_fit <- survfit(surv_object ~ period, data = test)
+
+ggsurvplot(km_fit, conf.int = TRUE, pval = TRUE, 
+           legend.title = "Fire Type",
+           xlab = "Fire Running Time (Hours)", 
+           title = "Kaplan-Meier Curve by Fire Type")
+```
+It does not seem to make any difference.
+
+We want to check if there is a difference between all fires before 2015 and after
+
+
+```{r}
+test <- clean_data %>%
+          mutate(period = ifelse(FIRE_YEAR < 2015, "Before 2015", "After 2015"))
+
+surv_object <- Surv(time = clean_data$FIRE_TIME_HOUR, 
+                    event = clean_data$event)
+
+km_fit <- survfit(surv_object ~ period, data = test)
+
+ggsurvplot(km_fit, conf.int = TRUE, pval = TRUE, 
+           legend.title = "Fire Type",
+           xlab = "Fire Running Time (Hours)", 
+           title = "Kaplan-Meier Curve by Fire Type")
+```
