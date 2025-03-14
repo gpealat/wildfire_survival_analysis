@@ -1,0 +1,399 @@
+---
+title: "Survival Analysis"
+author: "Anh BUI"
+output: html_document
+---
+
+# Load required packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DBI)
+library(RSQLite)
+library(dbplyr)
+library(dplyr)
+library(lubridate)
+library(here)
+library(survival)
+library(survminer)
+library(tidyverse)
+library(ggplot2)
+```
+
+# Load dataset
+```{r}
+#Create a function to load the data from the /data folder
+load_data<-function(){
+  # create db connection
+  conn <- dbConnect(SQLite(), './data.sqlite')
+  
+  # pull the fires table into RAM
+  fires <- tbl(conn, "Fires") %>% collect()
+  
+  # disconnect from db
+  dbDisconnect(conn)
+
+  return(fires)  
+}
+
+# Calling the function
+data <-load_data()
+```
+
+```{r}
+# Glimpse of dataset
+glimpse(data)
+```
+
+# EDA: Define survival variables for survival analysis
+```{r}
+# Check the whole dataset type
+class(data)
+data <- as.data.frame(data)
+```
+
+```{r}
+# Double check dataset type, it should now be only Dataframe
+class(data)
+```
+```{r}
+dim(data)
+```
+
+
+```{r}
+# Check missing values
+na_per_column <- colSums(is.na(data))  # Count NAs per column
+total_rows <- nrow(data)  # Total number of rows
+
+na_rate_per_column <- (na_per_column / total_rows) * 100  # Convert to percentage
+na_rate_per_column <- na_rate_per_column[na_rate_per_column > 0]  # Filter only columns with NAs
+na_rate_per_column <- sort(round(na_rate_per_column, 2), decreasing = TRUE)  # Round to 2 decimal places & sort from high to low
+
+print(na_rate_per_column)
+```
+
+
+```{r}
+# Remove columns with missing rates > 70%
+clean_data <- data %>%
+  select_if(~ mean(is.na(.)) <= 0.7)  # Keep columns where NA rate is ≤ 70%
+
+print("Columns with >70% NAs removed.")
+```
+
+```{r}
+# Remove other unnecessary columns 
+clean_data <- clean_data %>%
+  select(-Shape,
+         -OBJECTID,
+         -LOCAL_INCIDENT_ID,
+         -FIRE_NAME,
+         -COUNTY,
+         -FIPS_CODE,
+         -FIPS_NAME)  
+```
+
+```{r}
+# Now we want to filter out all rows which does not contains values in either one of those columns: DISCOVERY_DATE, DISCOVERY_TIME, CONT_DATE and CONT_TIME
+clean_data <- clean_data %>%
+                filter(DISCOVERY_DATE != "" & !is.na(DISCOVERY_DATE) &
+                         DISCOVERY_TIME != "" & !is.na(DISCOVERY_TIME) & 
+                        CONT_DATE != "" & !is.na(CONT_DATE) & 
+                         CONT_TIME != "" & !is.na(CONT_TIME) )
+```
+
+```{r}
+dim(clean_data)
+```
+
+Note that we are now down to 892,007 data points.
+
+## Feature engineering
+
+> A good dataset for survival analaysis should be well-defined:
+Survival time (time): Days/hours between discovery date/time and containment date/time
+Event (status): Whether the fire has occured (1) or ongoing (0)
+
+```{r}
+# Convert Julian dates to standard date format
+clean_data$CONT_DATE <- as.Date(clean_data$CONT_DATE - 2458014.5, origin = "2017-09-18")
+clean_data$DISCOVERY_DATE <- as.Date(clean_data$DISCOVERY_DATE - 2458014.5, origin = "2017-09-18")
+```
+
+We now want to calculate the time each fire ran until they were stopped.
+We first have to create a new column of for the exact date and time for both category. We calculate this difference FIRE_DURATION in Hours.
+
+```{r}
+clean_data <- clean_data %>% 
+                  mutate(FIRE_START_DATE = as.POSIXct(paste(DISCOVERY_DATE, DISCOVERY_TIME), format = "%Y-%m-%d %H%M"),
+                         FIRE_END_DATE = as.POSIXct(paste(CONT_DATE, CONT_TIME), format = "%Y-%m-%d %H%M")) %>%
+                  mutate(FIRE_DURATION = as.numeric(difftime(FIRE_END_DATE, FIRE_START_DATE, units="hours"))) %>%
+                  mutate(DISCOVERY_TIME = as.numeric(substr(DISCOVERY_TIME, 1, 2))) %>%
+                  select(-DISCOVERY_DATE, -CONT_DATE, -CONT_TIME)
+```
+
+```{r}
+dim(clean_data)
+```
+
+
+```{r}
+# Plot histogram
+ggplot(clean_data_2, aes(x = FIRE_DURATION)) +
+  geom_histogram(binwidth = 0.5, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+
+We realize that a lot of fire have been running for 0 minutes. It is probably minor fires and were just inputted in the system for statistics purposes. We will also exclude them.
+
+```{r}
+clean_data <- clean_data %>%
+                filter(FIRE_DURATION != 0)
+```
+
+```{r}
+dim(clean_data)
+```
+We are now down to 779,457 data points.
+
+```{r}
+# Plot histogram
+ggplot(clean_data, aes(x = FIRE_DURATION)) +
+  geom_histogram(binwidth = 0.5, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+
+The maximum time in the actual data is 8759.67 hours, which corresponds to 365 days (so a year).
+It seems unrealistic, so to cater with the fact we might have bad inputs, we will filter out all data that have a running time longer than a month (30*24= 720 H)
+
+```{r}
+clean_data <- clean_data %>%
+                filter(FIRE_DURATION<= 720 )
+```
+
+```{r}
+# Plot histogram
+ggplot(clean_data, aes(x = FIRE_DURATION)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Values", x = "Values", y = "Frequency") +
+  theme_minimal()
+```
+We finalize the data to add event = 1, to indicate that no data has to be censored.
+```{r}
+clean_data$event <- 1  # No censored data (all fires finished)
+```
+
+# Nonparametric survival estimation (Kaplan-Meier curve)
+## Estimate and visualize overall survival probability of wildfires
+
+```{r}
+# Fit Kaplan-Meier model
+km_fit <- survfit(Surv(FIRE_DURATION, event) ~ 1, data = clean_data)
+
+# Plot the survival curve
+ggsurvplot(
+  km_fit,
+  conf.int = TRUE,
+  risk.table = TRUE,  # Adding a risk table might help
+  surv.median.line = "hv",  # Add median survival lines
+  xlab = "Fire running time (Hours)",
+  ylab = "Survival probability",
+  title = "Kaplan-Meier survival curve for wildfire containment",
+  palette = "default"  # Specify a color palette
+)
+```
+*Interpretation:
+The Kaplan-Meier survival curve for wildfire containment provides insights into how long wildfires persist before being fully contained.
+- The curve drops sharply within the first few hours, indicating that most wildfires are contained relatively quickly. Plus, the survival probability falls from nearly 1.0 to below 0.25 within a short duration, suggesting that a large proportion of wildfires are extinguished within the early hours.
+- Flattened curve after the drop: After the initial drop, the survival probability levels out, meaning that the remaining fires take significantly longer to be contained. There are still a few fires persisting beyond 200, 400, or even 600 hours, but these are rare.
+- Median survival time
+The median survival time (the time at which 50% of the wildfires are contained) appears to be very short, likely within the first few hours.
+
+# Compare survival between groups
+## Compare survival by fire cause
+
+```{r}
+km_cause <- survfit(Surv(FIRE_DURATION, event) ~ STAT_CAUSE_DESCR, data = clean_data)
+
+ggsurvplot(km_cause, conf.int = TRUE, pval = TRUE,
+           title = "Survival curves by Fire cause",
+           xlab = "Fire running time (Hours)", ylab = "Survival probability",
+           legend.title = "Fire Cause")
+
+
+```
+Observations:
+- Significant differences between Fire Causes (p < 0.0001): The p-value of < 0.0001 (likely from a Log-Rank test) suggests that there is a statistically significant difference in survival curves between fire causes, which means that some fire causes tend to have longer containment times than others.
+- Fire causes differ in containment time: Lightning-caused fires appear to have the longest containment time, as the survival probability remains higher for longer.
+Other causes (Debris Burning, Equipment Use, Fireworks, Miscellaneous) tend to have steeper declines, indicating faster containment.
+
+To gain deeper insights into wildfire containment time, we should identify which specific fire causes differ significantly:
+```{r}
+pairwise_survdiff(Surv(FIRE_DURATION, event) ~ STAT_CAUSE_DESCR, data = clean_data)
+```
+Interpretations:
+- Highly significant differences between most Fire causes (p < 2e-16): The majority of comparisons have extremely small p-values (< 2e-16), suggesting that fires caused by different factors have significantly different containment times.
+- Lightning-caused fires vs. Others: Fires caused by Lightning tend to have significantly longer containment times compared to nearly all other causes (p < 2e-16 for most).
+This aligns with previous Kaplan-Meier curves, where lightning fires had the highest survival probability over time.
+- Fires from Debris Burning, Equipment Use, and Arson are contained faster: These causes show statistically significant differences from longer-burning fires (e.g., Lightning, Powerline). It seems that Debris Burning and Equipment Use fires might be more manageable or easier to control.
+
+
+## Compare survival by fire size class
+```{r}
+km_size <- survfit(Surv(FIRE_DURATION, event) ~ FIRE_SIZE_CLASS, data = clean_data)
+ggsurvplot(km_size,
+           conf.int = TRUE,
+           pval = TRUE,
+           legend.title = "Fire size class",
+           xlab = "Fire running time (Hours)",
+           ylab = "Survival probability",
+           title = "Kaplan-Meier curves by Fire size class")
+```
+Interpretations:
+- Larger fires take significantly longer to contain: The survival curves clearly separate based on fire size, showing that larger fires (e.g., Class F, G) persist much longer before containment:
+ + The smallest fires (Class A, B) drop sharply within a short period, meaning they are contained quickly.
+ + Larger fires (Classes E, F, G) decline more slowly, indicating prolonged burning duration. We will further analyze if containment time for larger fires varies by state or region?
+- Significant difference in containment time between size classes (p < 0.0001): Since p-value is extremely low, the differences between fire size classes are not due to chance.
+Prolonged Containment for Largest Fires (Classes F & G)
+
+The largest fires (magenta and purple curves) show a much slower decrease in survival probability, meaning that a significant proportion of these fires remain uncontained for extended periods (200+ hours).
+These fires are likely more intense, in remote locations, or difficult to control due to weather conditions.
+
+
+## Is there a relationship between cause and fire size?
+Do certain causes (e.g., Lightning, Powerline) lead to larger fires that last longer?
+```{r}
+ggplot(clean_data, aes(x = STAT_CAUSE_DESCR, y = FIRE_SIZE, fill = STAT_CAUSE_DESCR)) +
+  geom_boxplot() +
+  labs(title = "Wildfire Size Distribution by Cause", x = "Fire Cause", y = "Fire Size (Acres)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill=FALSE)
+
+```
+Interpretation:
+- Lightning tend to cause the largest fire sizes (up to 200,000+ acres): The high number of extreme outliers suggests that lightning-ignited fires are more likely to become massive wildfires.
+- Most other Fire causes result in smaller fires: Fires caused by Arson, Campfires, Fireworks, Equipment Use, Smoking, Railroads, and Structures generally have much smaller fire sizes. There are few to no extreme outliers for these causes, suggesting they are contained faster.
+- High density of small fires across all causes: Most fire sizes cluster close to 0 acres, showing that the majority of wildfires are small, regardless of the cause. This aligns with previous Kaplan-Meier survival curves, where most wildfires are contained quickly.
+
+
+
+## Does containment time for larger fires vary by state or region?
+We will conduct a Kaplan-Meier survival analysis for the Top 10 states with the largest wildfires. 
+```{r}
+# Identify Top 10 states by total wildfire size
+top_states <- clean_data %>%
+  group_by(STATE) %>%
+  summarise(Total_Fire_Size = sum(FIRE_SIZE, na.rm = TRUE)) %>%
+  arrange(desc(Total_Fire_Size)) %>%
+  head(10) %>%
+  pull(STATE)
+
+# Filter dataset for only these states
+top_state_data <- clean_data %>% filter(STATE %in% top_states)
+```
+
+```{r}
+# Fit Kaplan-Meier model
+km_state <- survfit(Surv(FIRE_DURATION, event) ~ STATE, data = top_state_data)
+
+# Plot the survival curves
+ggsurvplot(km_state, conf.int = TRUE, 
+           title = "Kaplan-Meier Survival Curves for Wildfire Containment by State",
+           xlab = "Fire Running Time (Hours)", 
+           ylab = "Survival Probability",
+           legend.title = "State")
+
+```
+Interpretations:
+- Wildfires in Alaska (AK) take significantly longer to contain: The survival probability in Alaska (red line) is consistently higher than in all other states.
+- Other states have faster containment: States like California (CA), Arizona (AZ), Texas (TX), and Oregon (OR) show much steeper declines in survival probability, suggesting that wildfires in these states are generally contained more quickly. Possible reasons: More resources allocated for containment due to frequent wildfires.
+
+# If are frequent wildfires associated with shorter containment times?
+The hypothesis is that states with more frequent wildfires may have better firefighting resources and strategies, leading to faster containment.
+
+```{r}
+# Count total wildfires per state
+wildfire_frequency <- clean_data %>%
+  group_by(STATE) %>%
+  summarise(Total_Wildfires = n(),
+            Median_Containment_Time = median(FIRE_DURATION, na.rm = TRUE))
+
+# Display wildfire counts per state
+print(wildfire_frequency)
+```
+
+```{r}
+ggplot(wildfire_frequency, aes(x = Total_Wildfires, y = Median_Containment_Time)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Wildfire frequency vs. Median containment time",
+       x = "Total wildfires in state",
+       y = "Median containment time (Hours)") +
+  theme_minimal()
+
+```
+Interpretations:
+- Negative correlation between Wildfire frequency and Containment time: The red regression line slopes downward, indicating a slight negative correlation, suggesting that states with more frequent wildfires tend to have shorter containment times.
+Most states have low containment times: The majority of states have a median containment time close to 0-5 hours, regardless of wildfire frequency, which indicates that most fires are controlled quickly, even in states with fewer fires.
+Conclusion: High-frequency wildfire states appear to have shorter containment times as states with over 50,000 wildfires show very low median containment times (near 0-2 hours), which supports the idea that firefighting infrastructure is better in places where wildfires are frequent.
+
+
+
+## Compare survival by Time period (Before vs. After 2000)
+```{r}
+# Create categorical time period
+fires <- fires %>%
+  mutate(Period = ifelse(FIRE_YEAR < 2000, "Before 2000", "2000 and After"))
+
+# Kaplan-Meier estimation by time period
+km_time_period <- survfit(Surv(survival_time, status) ~ Period, data = fires)
+
+ggsurvplot(km_time_period,
+           conf.int = TRUE,
+           pval = TRUE,
+           legend.title = "Period",
+           xlab = "Days",
+           ylab = "Survival Probability",
+           title = "Kaplan-Meier curves by Period (Before and After 2000)")
+```
+
+# Cox proportional hazards model
+To quantify the effects of fire cause, fire size, and other factors on containment probability:
+```{r}
+# Convert categorical variables into factors for Cox regression
+clean_data <- clean_data %>%
+  mutate(
+    STAT_CAUSE_DESCR = as.factor(STAT_CAUSE_DESCR),
+    STATE = as.factor(STATE)
+  )
+
+# Compute total wildfires per state
+wildfire_counts <- clean_data %>%
+  group_by(STATE) %>%
+  summarise(TOTAL_WILDFIRES = n())
+
+# Merge with the main dataset
+clean_data <- clean_data %>%
+  left_join(wildfire_counts, by = "STATE")
+```
+
+## As the effect of some variables on fire containment changes over time and FIRE_SIZE is violating the assumption, we firstly try to introduce an interaction with time because the Cox model assumes that hazard ratios (HRs) remain constant over time.
+```{r}
+clean_data$FIRE_SIZE_TIME <- clean_data$FIRE_SIZE * log(clean_data$FIRE_DURATION + 1)
+
+# Fit the Cox proportional hazards model
+cox_model_time_dependent <- coxph(Surv(FIRE_DURATION, event) ~ FIRE_SIZE + FIRE_SIZE_TIME + TOTAL_WILDFIRES + STATE + STAT_CAUSE_DESCR, 
+                                  data = clean_data)
+summary(cox_model_time_dependent)
+
+```
+
+```{r}
+cox.zph(cox_model_time_dependent) 
+```
+Since p-value is < 2e-16, it means the effect of fire size on containment time changes over time and Cox model is not appropriate for these types of variables.
+
+
